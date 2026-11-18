@@ -1,0 +1,55 @@
+{
+  "launch_time_local": "2026-11-19T00:00:00",
+  "streamer_name": "Kai",
+  "campaign": {
+    "name": "REPLACE_WITH_CAMPAIGN_NAME",
+    "required_hashtags": [
+      "#GTA6"
+    ],
+    "disclosure": "#ad #paidpartnership",
+    "notes": "Copy the exact rules from the campaign brief here. Check: no leaked/pre-release footage, no other tool's watermark, paid-partnership label."
+  },
+  "paths": {
+    "inbox": "inbox",
+    "clips": "clips",
+    "queue": "queue.json",
+    "submissions": "submissions.csv"
+  },
+  "detect": {
+    "clip_before_s": 6,
+    "clip_after_s": 12,
+    "top_n_per_video": 12,
+    "min_gap_s": 25,
+    "z_min": 2.5
+  },
+  "render": {
+    "font": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "captions": true,
+    "blur_nudity": true,
+    "mute_nudity_audio": true,
+    "bleep_swears": true,
+    "keep_unbleeped_copy": true,
+    "delete_source_after_clips": false
+  },
+  "accounts": {
+    "youtube": "my_clip_channel",
+    "tiktok": "my_tiktok_handle",
+    "instagram": "my_instagram_handle"
+  },
+  "youtube": {
+    "privacy": "public",
+    "client_secret": "client_secret.json",
+    "token": "yt_token.json"
+  },
+  "schedule": {
+    "posts_per_day_per_platform": 3,
+    "window_start_hour": 10,
+    "window_end_hour": 22
+  },
+  "tiktok": {
+    "mode": "direct",
+    "privacy": "PUBLIC_TO_EVERYONE",
+    "paid_partnership": true,
+    "redirect_uri": "https://YOUR-REGISTERED-REDIRECT-URI/callback"
+  }
+}
