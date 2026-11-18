@@ -1,11 +1,7 @@
 numpy
-# optional, for burned-in captions (downloads a model on first run):
+requests
 faster-whisper
-# optional, for YouTube auto-upload:
+nudenet>=3.0
 google-api-python-client
 google-auth-oauthlib
-# optional, to download campaign-approved sources:
 yt-dlp
-requests
-# optional: visual nudity detection and blur:
-NudeNet

@@ -3,92 +3,122 @@ import glob
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import time
 from datetime import datetime
 
 from . import queue as Q
-from .captions import make_srt, find_swear_windows
+from .captions import swear_windows, transcribe_words
 from .detect import find_moments
 from .executables import find_executable
-from .render import pick_hook, render_clip
+from .render import pick_hook, render_clip, verify_clip
 from .safety import find_nudity_windows, mute_windows_without_speech
 
 VIDEO_EXT = (".mp4", ".mkv", ".mov", ".webm", ".ts")
+_SEEN = set()  # videos already handled in this run (watch/run loops call cmd_watch repeatedly)
 
 
 def load_cfg(p):
     with open(p, encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    key = str(os.environ.get("CLIPPER_STREAMER") or cfg.get("streamer_name", "")).strip().lower()
+    profile = cfg.get("streamer_profiles", {}).get(key)
+    if profile:
+        cfg["streamer_name"] = profile["name"]
+        cfg["campaign"]["required_hashtags"] = profile["hashtags"]
+        cfg["campaign"]["disclosure"] = profile.get("disclosure", "")
+        cfg["accounts"] = {**cfg.get("accounts", {}), **profile.get("accounts", {})}
+    elif os.environ.get("CLIPPER_STREAMER"):
+        custom_name = os.environ["CLIPPER_STREAMER"].strip()
+        cfg["streamer_name"] = custom_name
+        safe_tag = "#" + re.sub(r"[^A-Za-z0-9]", "", custom_name)
+        cfg["campaign"]["required_hashtags"] = [safe_tag, "#GTA6"]
+    cfg.setdefault("campaign", {}).setdefault("required_hashtags", [])
+    cfg.setdefault("campaign", {}).setdefault("disclosure", "")
+    return cfg
 
 
 def caption_text(cfg, hook):
     c = cfg["campaign"]
-    return f"{hook.title()} {' '.join(c['required_hashtags'])} {c['disclosure']}".strip()
+    name = cfg["streamer_name"]
+    return f"{name.upper()} {hook.title()} {' '.join(c['required_hashtags'])} {c['disclosure']}".strip()
+
+
+def _inside(path, folder):
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(folder)]) == os.path.abspath(folder)
+    except ValueError:  # different drives on Windows
+        return False
+
+
+def _done_marker(cfg, src):
+    return os.path.join(cfg["paths"]["clips"], os.path.splitext(os.path.basename(src))[0] + ".done")
+
+
+def already_processed(cfg, src):
+    """True only if a previous run FINISHED this video (a crash halfway must be retried)."""
+    return os.path.exists(_done_marker(cfg, src))
 
 
 def process_video(cfg, src):
-    d, paths = cfg["detect"], cfg["paths"]
+    d, paths, r = cfg["detect"], cfg["paths"], cfg["render"]
     os.makedirs(paths["clips"], exist_ok=True)
     moments = find_moments(src, d["clip_before_s"], d["clip_after_s"], d["top_n_per_video"], d["min_gap_s"], d["z_min"])
     print(f"{os.path.basename(src)}: {len(moments)} moments")
     items = Q.load(paths["queue"])
     stem = os.path.splitext(os.path.basename(src))[0]
+    captions_on = r.get("captions", True)
+    bleep_on = r.get("bleep_swears", True)
+    blur_on = r.get("blur_nudity", True)
+    mute_nudity = r.get("mute_nudity_audio", True)
+    extra = tuple(w.lower() for w in r.get("extra_profanity", []))
+    need_words = captions_on or bleep_on or (blur_on and mute_nudity)
+    rendered = []
     for i, m in enumerate(moments):
         out = os.path.join(paths["clips"], f"{stem}_{i:02d}.mp4")
-        hook = pick_hook(cfg["streamer_name"], i)
-        render_cfg = cfg["render"]
-        srt = None
-        if cfg["render"]["captions"]:
-            srt = make_srt(
-                src,
-                m["start"],
-                m["end"],
-                out.replace(".mp4", ".srt"),
-                redact_swears=render_cfg.get("bleep_swears", True),
-            )
-        safety_windows = []
-        mute_windows = []
-        swear_windows = find_swear_windows(src, m["start"], m["end"]) if cfg["render"]["captions"] else []
-        if render_cfg.get("blur_nudity", True):
-            safety_windows = find_nudity_windows(src, m["start"], m["end"])
-        if render_cfg.get("mute_nudity_audio", False) and safety_windows:
-            mute_windows = mute_windows_without_speech(safety_windows, srt, m["start"])
-        render_clip(
-            src,
-            m["start"],
-            m["end"],
-            out,
-            hook,
-            render_cfg["font"],
-            srt,
-            safety_windows=safety_windows,
-            mute_windows=mute_windows,
-            swear_windows=swear_windows,
-            bleep_swears=render_cfg.get("bleep_swears", True),
-        )
-        if render_cfg.get("keep_unbleeped_copy", True) and swear_windows:
-            original_out = out.replace(".mp4", "_unbleeped.mp4")
-            original_srt = None
-            if render_cfg["captions"]:
-                original_srt = make_srt(
-                    src, m["start"], m["end"],
-                    original_out.replace(".mp4", ".srt"),
-                    redact_swears=False,
-                )
-            render_clip(
-                src, m["start"], m["end"], original_out, hook,
-                render_cfg["font"], original_srt,
-                safety_windows=safety_windows,
-                mute_windows=mute_windows,
-                bleep_swears=False,
-            )
+        dur = m["end"] - m["start"]
+        hook = pick_hook(cfg["streamer_name"], i, r.get("hooks"))
+
+        # One transcript per clip feeds captions, bleeps and the "never mute the streamer" rule.
+        # Missing models raise (fail closed) instead of silently posting unfiltered clips.
+        words = transcribe_words(src, m["start"], m["end"], r.get("whisper_model", "small"),
+                                 r.get("language", "en")) if need_words else []
+        swears = swear_windows(words, extra) if bleep_on else []
+        blur = find_nudity_windows(src, m["start"], m["end"]) if blur_on else []
+        silence = mute_windows_without_speech(blur, [(w["start"], w["end"]) for w in words]) \
+            if (blur and mute_nudity) else []
+
+        common = dict(words=words if captions_on else None, caption_font=r.get("caption_font", "Arial"),
+                      blur_windows=blur, silence_windows=silence, extra_profanity=extra)
+        render_clip(src, m["start"], m["end"], out, hook, r["font"],
+                    bleep_windows=swears, redact_captions=bleep_on, **common)
+        verify_clip(out)
+        rendered.append(out)
+        if r.get("keep_unbleeped_copy", True) and swears:
+            raw_out = out.replace(".mp4", "_unbleeped.mp4")
+            render_clip(src, m["start"], m["end"], raw_out, hook, r["font"],
+                        bleep_windows=[], redact_captions=False, **common)
+            verify_clip(raw_out)
+
+        with open(out.replace(".mp4", ".json"), "w", encoding="utf-8") as f:  # audit trail for review
+            json.dump({"source": os.path.basename(src), "moment": m, "hook": hook,
+                       "bleeped_at_s": [list(map(lambda v: round(v, 2), w)) for w in swears],
+                       "blurred_at_s": [list(map(lambda v: round(v, 2), w)) for w in blur],
+                       "muted_at_s": [list(map(lambda v: round(v, 2), w)) for w in silence],
+                       "transcript": " ".join(w["text"] for w in words)}, f, indent=2)
         Q.add_clip(items, out, caption_text(cfg, hook), hook, m["score"], list(cfg["accounts"].keys()))
-        print(f"  rendered {out} (score {m['score']}, peak {m['peak']}s)")
+        Q.save(paths["queue"], items)  # save per clip so a later crash doesn't lose finished clips
+        print(f"  rendered {out} (score {m['score']}, peak {m['peak']}s, {dur:.0f}s) "
+              f"bleeps={len(swears)} blurred={len(blur)} muted={len(silence)}")
     Q.save(paths["queue"], items)
-    if moments and cfg["render"].get("delete_source_after_clips", False):
-        if os.path.isfile(src) and os.path.commonpath([os.path.abspath(src), os.path.abspath(paths["inbox"])]) == os.path.abspath(paths["inbox"]):
+    with open(_done_marker(cfg, src), "w", encoding="utf-8") as f:
+        f.write(datetime.now().isoformat(timespec="seconds"))
+
+    # Free disk space only when EVERY clip rendered AND passed verification (verify_clip raises otherwise).
+    if moments and len(rendered) == len(moments) and r.get("delete_source_after_clips", False):
+        if os.path.isfile(src) and _inside(src, paths["inbox"]):
             os.remove(src)
             print(f"  deleted processed source {src}")
 
@@ -99,17 +129,19 @@ def cmd_process(a):
 
 def cmd_watch(a):
     cfg = load_cfg(a.config)
-    inbox, seen = cfg["paths"]["inbox"], set()
+    inbox = cfg["paths"]["inbox"]
     os.makedirs(inbox, exist_ok=True)
     print(f"watching {inbox}/ (drop campaign-approved footage or your own recordings here)")
     while True:
         for f in sorted(glob.glob(os.path.join(inbox, "*"))):
-            if f.lower().endswith(VIDEO_EXT) and f not in seen:
+            if f.lower().endswith(VIDEO_EXT) and f not in _SEEN:
                 size = os.path.getsize(f)
                 time.sleep(3)
                 if os.path.getsize(f) != size:  # still being written
                     continue
-                seen.add(f)
+                _SEEN.add(f)
+                if already_processed(cfg, f):
+                    continue
                 process_video(cfg, f)
                 items = Q.schedule(Q.load(cfg["paths"]["queue"]), cfg["schedule"])
                 Q.save(cfg["paths"]["queue"], items)
@@ -120,6 +152,8 @@ def cmd_watch(a):
 
 def cmd_wait(a):
     cfg = load_cfg(a.config)
+    if not cfg.get("launch_time_local"):
+        return
     t = datetime.fromisoformat(cfg["launch_time_local"])
     while datetime.now() < t:
         left = t - datetime.now()
@@ -146,11 +180,12 @@ def cmd_post(a):
             if it["platform"] == "youtube":
                 from .post_youtube import upload
                 yt = cfg.get("youtube", {})
+                title = f"{it['hook'].title()} #Shorts"[:100]  # short title; hashtags + disclosure go in the description
                 it["url"] = upload(
                     it["clip"],
-                    it["title"][:100],
+                    title,
                     it["title"],
-                    ["GTA6", "Shorts"],
+                    yt.get("tags", ["Shorts"]),
                     secrets=yt.get("client_secret", "client_secret.json"),
                     token=yt.get("token", "yt_token.json"),
                     privacy=yt.get("privacy", "public"),
@@ -266,7 +301,7 @@ def cmd_cleanup_source(a):
     cfg = load_cfg(a.config)
     source = os.path.abspath(a.source)
     inbox = os.path.abspath(cfg["paths"]["inbox"])
-    if os.path.commonpath([source, inbox]) != inbox:
+    if not _inside(source, inbox):
         raise SystemExit("Refusing to delete a file outside the configured inbox/")
     if not source.lower().endswith(VIDEO_EXT):
         raise SystemExit("Source must be a video file")
@@ -276,8 +311,10 @@ def cmd_cleanup_source(a):
     clips = [
         os.path.join(cfg["paths"]["clips"], name)
         for name in os.listdir(cfg["paths"]["clips"])
-        if name.startswith(stem + "_") and name.lower().endswith(".mp4")
+        if re.fullmatch(re.escape(stem) + r"_\d\d\.mp4", name)
     ]
+    for c in clips:
+        verify_clip(c)  # never delete the source if a clip is broken
     if not clips:
         raise SystemExit("No rendered clips found; source was not deleted")
     if not a.force:
@@ -305,6 +342,7 @@ def cmd_run(a):
 def main():
     p = argparse.ArgumentParser(prog="clipper")
     p.add_argument("-c", "--config", default="config.json")
+    p.add_argument("-s", "--streamer", help="Streamer profile key: yourrage, lacy, clix, or a custom profile")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("process"); s.add_argument("video"); s.set_defaults(f=cmd_process)
     s = sub.add_parser("watch"); s.add_argument("--once", action="store_true"); s.set_defaults(f=cmd_watch)
@@ -319,6 +357,10 @@ def main():
     s = sub.add_parser("cleanup-source"); s.add_argument("source"); s.add_argument("--force", action="store_true"); s.set_defaults(f=cmd_cleanup_source)
     sub.add_parser("run").set_defaults(f=cmd_run)
     a = p.parse_args()
+    if getattr(a, "streamer", None):
+        os.environ["CLIPPER_STREAMER"] = a.streamer
+    else:
+        os.environ.pop("CLIPPER_STREAMER", None)
     a.f(a)
 
 

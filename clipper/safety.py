@@ -1,96 +1,75 @@
+"""Visual safety: find frames with exposed nudity so they can be blurred (and muted when
+nobody is talking). All returned windows are in seconds RELATIVE TO THE CLIP START."""
 import os
 import subprocess
 import tempfile
 
 from .executables import executable_path
 
+# Explicit list. Do NOT substring-match "EXPOSED": that also catches FEET_EXPOSED,
+# BELLY_EXPOSED, ARMPITS_EXPOSED and MALE_BREAST_EXPOSED and blurs ordinary footage.
+UNSAFE_LABELS = {
+    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+    "ANUS_EXPOSED",
+    # NudeNet 2.x naming, in case an older version is installed:
+    "EXPOSED_BREAST_F", "EXPOSED_GENITALIA_F", "EXPOSED_GENITALIA_M", "EXPOSED_BUTTOCKS", "EXPOSED_ANUS",
+}
 
-UNSAFE_LABELS = (
-    "EXPOSED",
-    "NUDE",
-    "SEX",
-)
-
-
-def speech_windows_from_srt(srt_path):
-    if not srt_path or not os.path.exists(srt_path):
-        return []
-    windows = []
-    with open(srt_path, "r", encoding="utf-8") as srt:
-        lines = [line.strip() for line in srt.readlines()]
-    for line in lines:
-        if "-->" not in line:
-            continue
-        start_text, end_text = (part.strip() for part in line.split("-->", 1))
-
-        def seconds(value):
-            hours, minutes, remainder = value.replace(",", ".").split(":")
-            return int(hours) * 3600 + int(minutes) * 60 + float(remainder)
-
-        windows.append((seconds(start_text), seconds(end_text)))
-    return windows
+_detector = None
 
 
-def mute_windows_without_speech(safety_windows, srt_path, clip_start):
-    speech = speech_windows_from_srt(srt_path)
-    muted = []
-    for safety_start, safety_end in safety_windows:
-        relative_start = safety_start - clip_start
-        relative_end = safety_end - clip_start
-        overlaps_speech = any(
-            relative_start < speech_end and relative_end > speech_start
-            for speech_start, speech_end in speech
-        )
-        if not overlaps_speech:
-            muted.append((relative_start, relative_end))
-    return muted
+def _get_detector():
+    global _detector
+    if _detector is None:
+        try:
+            from nudenet import NudeDetector
+        except ImportError as exc:
+            raise RuntimeError(
+                "blur_nudity is on but NudeNet is not installed, so NOTHING would be blurred. "
+                "Run: pip install nudenet   (or set render.blur_nudity to false on purpose)."
+            ) from exc
+        _detector = NudeDetector()
+    return _detector
 
 
-def find_nudity_windows(src, start, end, sample_interval_s=1.0):
-    try:
-        from nudenet import NudeDetector
-    except ImportError:
-        return []
+def mute_windows_without_speech(blur_windows, speech_windows):
+    """Mute a blurred stretch only if nobody is talking in it: the streamer is never muted."""
+    return [
+        (a, b) for a, b in blur_windows
+        if not any(a < s_end and b > s_start for s_start, s_end in speech_windows)
+    ]
 
-    detector = NudeDetector()
-    unsafe = []
+
+def find_nudity_windows(src, start, end, sample_interval_s=0.5, threshold=0.40):
+    detector = _get_detector()
+    dur = end - start
+    flagged = []
     with tempfile.TemporaryDirectory() as frame_dir:
-        frame_pattern = os.path.join(frame_dir, "frame_%06d.jpg")
         subprocess.run(
-            [
-                executable_path("ffmpeg"), "-v", "error", "-ss", str(start),
-                "-i", os.path.abspath(src), "-t", str(end - start),
-                "-vf", f"fps=1/{sample_interval_s}",
-                "-frames:v", str(max(1, int((end - start) / sample_interval_s) + 1)),
-                frame_pattern,
-            ],
+            [executable_path("ffmpeg"), "-v", "error", "-ss", str(start), "-i", os.path.abspath(src),
+             "-t", str(dur), "-vf", f"fps=1/{sample_interval_s},scale=960:-2",
+             os.path.join(frame_dir, "f_%06d.jpg")],
             check=True,
         )
-        frame_paths = sorted(
-            os.path.join(frame_dir, name)
-            for name in os.listdir(frame_dir)
-            if name.lower().endswith(".jpg")
-        )
-        for index, image_path in enumerate(frame_paths):
-            timestamp = start + index * sample_interval_s
-            detections = detector.detect(image_path)
-            if any(
-                item.get("score", 0) >= 0.45
-                and any(token in str(item.get("class", "")).upper() for token in UNSAFE_LABELS)
-                for item in detections
-            ):
-                unsafe.append(timestamp)
-    if not unsafe:
+        frames = sorted(n for n in os.listdir(frame_dir) if n.endswith(".jpg"))
+        for idx, name in enumerate(frames):
+            hits = detector.detect(os.path.join(frame_dir, name))
+            if any(h.get("score", 0) >= threshold and str(h.get("class", "")).upper() in UNSAFE_LABELS
+                   for h in hits):
+                flagged.append(idx * sample_interval_s)
+    if not flagged:
         return []
 
-    windows = []
-    window_start = unsafe[0]
-    window_end = unsafe[0]
-    for timestamp in unsafe[1:]:
-        if timestamp - window_end <= sample_interval_s * 2:
-            window_end = timestamp
+    windows, w_start, w_end = [], flagged[0], flagged[0]
+    for t in flagged[1:]:
+        if t - w_end <= sample_interval_s * 2:
+            w_end = t
         else:
-            windows.append((max(start, window_start - 0.5), min(end, window_end + 0.5)))
-            window_start = window_end = timestamp
-    windows.append((max(start, window_start - 0.5), min(end, window_end + 0.5)))
-    return windows
+            windows.append((w_start, w_end))
+            w_start = w_end = t
+    windows.append((w_start, w_end))
+    pad = 0.5  # a frame stands for the next `interval` seconds, plus a safety margin
+    return [(max(0.0, a - pad), min(dur, b + sample_interval_s + pad)) for a, b in windows]

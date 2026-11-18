@@ -1,5 +1,25 @@
 # GTA 6 clipper
 
+## Streamer profiles
+
+Set `streamer_name` in `config.json`, or select a profile for one command:
+
+```powershell
+python -m clipper -s lacy process inbox\video.mp4
+python -m clipper -s yourrage url "TWITCH_OR_APPROVED_URL"
+python -m clipper -s clix watch --once
+```
+
+Built-in profiles add the correct name and required hashtag:
+
+- `lacy`: `LACY` and `#LACY`
+- `yourrage`: `YourRAGE` and `#yourrage`
+- `clix`: `Clix` and `#Clix`
+
+For another streamer, add a profile to `streamer_profiles` or use `-s CustomName`.
+The custom mode uses `#CustomName` plus `#GTA6` as a default and preserves the
+campaign disclosure and account settings from `config.json`.
+
 ## Public app information
 
 - [Terms of Service](./TERMS.md)

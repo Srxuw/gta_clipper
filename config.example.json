@@ -1,6 +1,26 @@
 {
   "launch_time_local": "2026-11-19T00:00:00",
-  "streamer_name": "Kai",
+  "streamer_name": "StreamerName",
+  "streamer_profiles": {
+    "yourrage": {
+      "name": "YourRAGE",
+      "hashtags": ["#yourrage", "#GTA6"],
+      "disclosure": "#ad #paidpartnership",
+      "accounts": {}
+    },
+    "lacy": {
+      "name": "LACY",
+      "hashtags": ["#LACY", "#GTA6"],
+      "disclosure": "#ad #paidpartnership",
+      "accounts": {}
+    },
+    "clix": {
+      "name": "Clix",
+      "hashtags": ["#Clix", "#GTA6"],
+      "disclosure": "#ad #paidpartnership",
+      "accounts": {}
+    }
+  },
   "campaign": {
     "name": "REPLACE_WITH_CAMPAIGN_NAME",
     "required_hashtags": [
